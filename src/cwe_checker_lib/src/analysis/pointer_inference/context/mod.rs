@@ -1,13 +1,12 @@
+use crate::abstract_domain::*;
 use crate::analysis::function_signature::FunctionSignature;
 use crate::analysis::graph::Graph;
 use crate::intermediate_representation::*;
 use crate::prelude::*;
 use crate::utils::log::*;
-use crate::{abstract_domain::*, utils::binary::RuntimeMemoryImage};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::state::State;
-use super::ValueDomain;
 use super::{Config, Data, VERSION};
 
 /// Contains methods of the `Context` struct that deal with the manipulation of abstract IDs.
@@ -24,9 +23,6 @@ pub struct Context<'a> {
     pub graph: &'a Graph<'a>,
     /// A reference to the `Project` object representing the binary
     pub project: &'a Project,
-    /// The runtime memory image for reading global read-only variables.
-    /// Note that values of writeable global memory segments are not tracked.
-    pub runtime_memory_image: &'a RuntimeMemoryImage,
     /// Maps the TIDs of functions that shall be treated as extern symbols to the `ExternSymbol` object representing it.
     pub extern_symbol_map: &'a BTreeMap<Tid, ExternSymbol>,
     /// Maps the TIDs of internal functions to the function signatures computed for it.
@@ -39,8 +35,6 @@ pub struct Context<'a> {
     pub log_collector: crossbeam_channel::Sender<LogThreadMsg>,
     /// Names of `malloc`-like extern functions.
     pub allocation_symbols: Vec<String>,
-    /// Names of `free`-like extern functions.
-    pub deallocation_symbols: Vec<String>,
 }
 
 impl<'a> Context<'a> {
@@ -54,12 +48,10 @@ impl<'a> Context<'a> {
         Context {
             graph: analysis_results.control_flow_graph,
             project: analysis_results.project,
-            runtime_memory_image: analysis_results.runtime_memory_image,
             extern_symbol_map: &analysis_results.project.program.term.extern_symbols,
             fn_signatures: analysis_results.function_signatures.unwrap(),
             log_collector,
             allocation_symbols: config.allocation_symbols,
-            deallocation_symbols: config.deallocation_symbols,
         }
     }
 
@@ -73,7 +65,9 @@ impl<'a> Context<'a> {
         address: &Expression,
     ) -> bool {
         if self.project.cpu_architecture.contains("MIPS") && var.name == "gp" {
-            if let Ok(gp_val) = state.load_value(address, var.size, self.runtime_memory_image) {
+            if let Ok(gp_val) =
+                state.load_value(address, var.size, &self.project.runtime_memory_image)
+            {
                 gp_val.is_top()
             } else {
                 true
@@ -122,61 +116,16 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// If the given `extern_symbol` is a call to a known allocation function
-    /// return the size of the memory object allocated by it.
-    ///
-    /// The function returns a `Top` element if the size could not be determined.
-    /// Known allocation functions: `malloc`, `realloc`, `calloc`.
-    fn get_allocation_size_of_alloc_call(
-        &self,
-        state: &State,
-        extern_symbol: &ExternSymbol,
-    ) -> ValueDomain {
-        let address_bytesize = self.project.get_pointer_bytesize();
-        let object_size = match extern_symbol.name.as_str() {
-            "malloc" => {
-                let size_parameter = extern_symbol.parameters.get(0).unwrap();
-                state
-                    .eval_parameter_arg(size_parameter, self.runtime_memory_image)
-                    .unwrap_or_else(|_| Data::new_top(address_bytesize))
-            }
-            "realloc" => {
-                let size_parameter = extern_symbol.parameters.get(1).unwrap();
-                state
-                    .eval_parameter_arg(size_parameter, self.runtime_memory_image)
-                    .unwrap_or_else(|_| Data::new_top(address_bytesize))
-            }
-            "calloc" => {
-                let size_param1 = extern_symbol.parameters.get(0).unwrap();
-                let size_param2 = extern_symbol.parameters.get(1).unwrap();
-                let param1_value = state
-                    .eval_parameter_arg(size_param1, self.runtime_memory_image)
-                    .unwrap_or_else(|_| Data::new_top(address_bytesize));
-                let param2_value = state
-                    .eval_parameter_arg(size_param2, self.runtime_memory_image)
-                    .unwrap_or_else(|_| Data::new_top(address_bytesize));
-                param1_value.bin_op(BinOpType::IntMult, &param2_value)
-            }
-            _ => DataDomain::new_top(address_bytesize),
-        };
-        object_size
-            .get_if_absolute_value()
-            .cloned()
-            .unwrap_or_else(|| ValueDomain::new_top(address_bytesize))
-    }
-
     /// Add a new abstract object and a pointer to it in the return register of an extern call.
     /// This models the behaviour of `malloc`-like functions,
     /// except that we cannot represent possible `NULL` pointers as return values yet.
     fn add_new_object_in_call_return_register(
         &self,
-        state: &State,
-        mut new_state: State,
+        mut state: State,
         call: &Term<Jmp>,
         extern_symbol: &ExternSymbol,
     ) -> State {
         let address_bytesize = self.project.get_pointer_bytesize();
-        let object_size = self.get_allocation_size_of_alloc_call(state, extern_symbol);
 
         match extern_symbol.get_unique_return_register() {
             Ok(return_register) => {
@@ -184,166 +133,22 @@ impl<'a> Context<'a> {
                     call.tid.clone(),
                     AbstractLocation::from_var(return_register).unwrap(),
                 );
-                new_state.memory.add_abstract_object(
+                state.memory.add_abstract_object(
                     object_id.clone(),
                     address_bytesize,
                     Some(super::object::ObjectType::Heap),
-                );
-                new_state.memory.set_lower_index_bound(
-                    &object_id,
-                    &Bitvector::zero(address_bytesize.into()).into(),
-                );
-                new_state.memory.set_upper_index_bound(
-                    &object_id,
-                    &(object_size - Bitvector::one(address_bytesize.into()).into()),
                 );
                 let pointer = Data::from_target(
                     object_id,
                     Bitvector::zero(apint::BitWidth::from(address_bytesize)).into(),
                 );
-                new_state.set_register(return_register, pointer);
-                new_state
+                state.set_register(return_register, pointer);
+                state
             }
             Err(err) => {
                 // We cannot track the new object, since we do not know where to store the pointer to it.
                 self.log_debug(Err(err), Some(&call.tid));
-                new_state
-            }
-        }
-    }
-
-    /// Mark the object that the parameter of a call is pointing to as freed.
-    /// If the object may have been already freed, generate a CWE warning.
-    /// This models the behaviour of `free` and similar functions.
-    fn mark_parameter_object_as_freed(
-        &self,
-        state: &State,
-        mut new_state: State,
-        call: &Term<Jmp>,
-        extern_symbol: &ExternSymbol,
-    ) -> State {
-        match extern_symbol.get_unique_parameter() {
-            Ok(parameter) => {
-                let parameter_value =
-                    state.eval_parameter_arg(parameter, self.runtime_memory_image);
-                match parameter_value {
-                    Ok(memory_object_pointer) => {
-                        if let Err(possible_double_frees) =
-                            new_state.mark_mem_object_as_freed(&memory_object_pointer)
-                        {
-                            let warning = CweWarning {
-                                name: "CWE415".to_string(),
-                                version: VERSION.to_string(),
-                                addresses: vec![call.tid.address.clone()],
-                                tids: vec![format!("{}", call.tid)],
-                                symbols: Vec::new(),
-                                other: vec![possible_double_frees
-                                    .into_iter()
-                                    .map(|(id, err)| format!("{}: {}", id, err))
-                                    .collect()],
-                                description: format!(
-                                    "(Double Free) Object may have been freed before at {}",
-                                    call.tid.address
-                                ),
-                            };
-                            let _ = self.log_collector.send(LogThreadMsg::Cwe(warning));
-                        }
-                        new_state.remove_unreferenced_objects();
-                        new_state
-                    }
-                    Err(err) => {
-                        self.log_debug(Err(err), Some(&call.tid));
-                        new_state
-                    }
-                }
-            }
-            Err(err) => {
-                // We do not know which memory object to free
-                self.log_debug(Err(err), Some(&call.tid));
-                new_state
-            }
-        }
-    }
-
-    /// Check all parameter registers of a call for dangling pointers and report possible use-after-frees.
-    fn check_parameter_register_for_dangling_pointer<'iter, I>(
-        &self,
-        state: &mut State,
-        call: &Term<Jmp>,
-        parameters: I,
-    ) where
-        I: Iterator<Item = &'iter Arg>,
-    {
-        for parameter in parameters {
-            match state.eval_parameter_arg(parameter, self.runtime_memory_image) {
-                Ok(value) => {
-                    if state.memory.is_dangling_pointer(&value, true) {
-                        state
-                            .memory
-                            .mark_dangling_pointer_targets_as_flagged(&value);
-                        let warning = CweWarning {
-                            name: "CWE416".to_string(),
-                            version: VERSION.to_string(),
-                            addresses: vec![call.tid.address.clone()],
-                            tids: vec![format!("{}", call.tid)],
-                            symbols: Vec::new(),
-                            other: Vec::new(),
-                            description: format!(
-                                "(Use After Free) Call at {} may access freed memory",
-                                call.tid.address
-                            ),
-                        };
-                        let _ = self.log_collector.send(LogThreadMsg::Cwe(warning));
-                    }
-                }
-                Err(err) => self.log_debug(
-                    Err(err.context(format!(
-                        "Function parameter {:?} could not be evaluated",
-                        parameter
-                    ))),
-                    Some(&call.tid),
-                ),
-            }
-        }
-    }
-
-    /// Check whether a parameter of a call to an extern symbol may point outside of the bounds of a memory object.
-    /// If yes, generate a CWE-warning,
-    /// since the pointer may be used for an out-of-bounds memory access by the function.
-    fn check_parameter_register_for_out_of_bounds_pointer(
-        &self,
-        state: &State,
-        call: &Term<Jmp>,
-        extern_symbol: &ExternSymbol,
-    ) {
-        for parameter in extern_symbol.parameters.iter() {
-            match state.eval_parameter_arg(parameter, self.runtime_memory_image) {
-                Ok(data) => {
-                    if state.pointer_contains_out_of_bounds_target(&data, self.runtime_memory_image)
-                    {
-                        let warning = CweWarning {
-                            name: "CWE119".to_string(),
-                            version: VERSION.to_string(),
-                            addresses: vec![call.tid.address.clone()],
-                            tids: vec![format!("{}", call.tid)],
-                            symbols: Vec::new(),
-                            other: Vec::new(),
-                            description: format!(
-                                "(Buffer Overflow) Call to {} at {} may access out-of-bounds memory",
-                                extern_symbol.name,
-                                call.tid.address
-                            ),
-                        };
-                        let _ = self.log_collector.send(LogThreadMsg::Cwe(warning));
-                    }
-                }
-                Err(err) => self.log_debug(
-                    Err(err.context(format!(
-                        "Function parameter {:?} could not be evaluated",
-                        parameter
-                    ))),
-                    Some(&call.tid),
-                ),
+                state
             }
         }
     }
@@ -394,7 +199,7 @@ impl<'a> Context<'a> {
         extern_symbol: &ExternSymbol,
     ) -> State {
         self.log_debug(
-            new_state.clear_stack_parameter(extern_symbol, self.runtime_memory_image),
+            new_state.clear_stack_parameter(extern_symbol, &self.project.runtime_memory_image),
             Some(&call.tid),
         );
         let calling_conv = self.project.get_calling_convention(extern_symbol);
@@ -413,7 +218,9 @@ impl<'a> Context<'a> {
             }
         } else {
             for parameter in extern_symbol.parameters.iter() {
-                if let Ok(data) = state.eval_parameter_arg(parameter, self.runtime_memory_image) {
+                if let Ok(data) =
+                    state.eval_parameter_arg(parameter, &self.project.runtime_memory_image)
+                {
                     possible_referenced_ids.extend(data.referenced_ids().cloned());
                 }
             }

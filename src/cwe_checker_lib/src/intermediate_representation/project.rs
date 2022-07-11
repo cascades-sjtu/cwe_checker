@@ -2,8 +2,12 @@ use super::*;
 use crate::utils::log::LogMessage;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+/// Contains implementation of the block duplication normalization pass.
 mod block_duplication_normalization;
 use block_duplication_normalization::*;
+/// Contains implementation of the propagate control flow normalization pass.
+mod propagate_control_flow;
+use propagate_control_flow::*;
 
 /// The `Project` struct is the main data structure representing a binary.
 ///
@@ -24,6 +28,8 @@ pub struct Project {
     pub register_set: BTreeSet<Variable>,
     /// Contains the properties of C data types. (e.g. size)
     pub datatype_properties: DatatypeProperties,
+    /// Represents the memory after loading the binary.
+    pub runtime_memory_image: RuntimeMemoryImage,
 }
 
 impl Project {
@@ -224,14 +230,24 @@ impl Project {
     /// - Duplicate blocks so that if a block is contained in several functions, each function gets its own unique copy.
     /// - Propagate input expressions along variable assignments.
     /// - Replace trivial expressions like `a XOR a` with their result.
-    /// - Remove dead register assignments
+    /// - Remove dead register assignments.
+    /// - Propagate the control flow along chains of conditionals with the same condition.
+    /// - Substitute bitwise `AND` and `OR` operations with the stack pointer
+    /// in cases where the result is known due to known stack pointer alignment.
     #[must_use]
     pub fn normalize(&mut self) -> Vec<LogMessage> {
-        let logs = self.remove_references_to_nonexisting_tids_and_retarget_non_returning_calls();
+        let mut logs =
+            self.remove_references_to_nonexisting_tids_and_retarget_non_returning_calls();
         make_block_to_sub_mapping_unique(self);
         self.propagate_input_expressions();
         self.substitute_trivial_expressions();
         crate::analysis::dead_variable_elimination::remove_dead_var_assignments(self);
+        propagate_control_flow(self);
+        logs.append(
+            crate::analysis::stack_alignment_substitution::substitute_and_on_stackpointer(self)
+                .unwrap_or_default()
+                .as_mut(),
+        );
         logs
     }
 }
@@ -313,6 +329,7 @@ mod tests {
                 calling_conventions,
                 register_set: integer_register.iter().cloned().collect(),
                 datatype_properties: DatatypeProperties::mock_x64(),
+                runtime_memory_image: RuntimeMemoryImage::mock(),
             }
         }
 
@@ -351,6 +368,7 @@ mod tests {
                 )]),
                 register_set: integer_register.collect(),
                 datatype_properties: DatatypeProperties::mock_arm32(),
+                runtime_memory_image: RuntimeMemoryImage::mock(),
             }
         }
     }
